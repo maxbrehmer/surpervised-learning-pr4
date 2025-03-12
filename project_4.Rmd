@@ -1,0 +1,300 @@
+---
+title: "Project 4"
+author: "Max Brehmer"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Load libraries
+library(tidyverse)
+library(ggplot2)
+library(vcd)
+library(reshape2)
+library(randomForest)
+library(caret)
+```
+
+
+```{r}
+# Load dataframe
+coupon_df <- read.csv("data/vehicle_data.csv",sep = ",")
+
+#number of non-missing observations in the "car" column
+sum(coupon_df$car != "")
+
+# number of missing observations not in the "car" column
+sum(coupon_df == "") - sum(coupon_df$car == "")
+
+# number of missing obs in other columns
+sum(coupon_df$Bar == "")
+sum(coupon_df$CoffeeHouse == "")
+sum(coupon_df$CarryAway == "")
+sum(coupon_df$RestaurantLessThan20 == "")
+sum(coupon_df$Restaurant20To50 == "")
+
+# all obs with missing values in some column except "car"
+nocar_coupon_df <- coupon_df[rowSums(coupon_df[,-15] == "") > 0,]
+
+# make copy of the original data frame and replace "" with NA values
+coupon_df1 <- coupon_df
+coupon_df1[coupon_df1 == ""] <- NA
+
+# remove "car" column
+coupon_df1 <- coupon_df1[,-15]
+
+# remove all observations with missing values
+coupon_df1 <- na.omit(coupon_df1)
+```
+
+```{r}
+# removing toCoupon_GEQ5min and direction_opp
+coupon_df1 <- coupon_df1[,-c(24,20)]
+
+# renaming columns
+coupon_df1 <- coupon_df1 %>%
+  rename(bar_gt1 = Bar, coffee_gt1 = CoffeeHouse, takeaway_gt1 = CarryAway, 
+         restaurantless20_gt1 = RestaurantLessThan20, restaurant20plus_gt1 = Restaurant20To50, 
+         accept_coupon = Y)
+
+# renaming and tranforming columns
+coupon_df1 <- coupon_df1 %>%
+  mutate(time = case_when(
+    time == "2PM"  ~ "Afternoon",
+    time == "10AM" ~ "Noon",
+    time == "6PM"  ~ "Evening",
+    time == "7AM"  ~ "Morning",
+    time == "10PM" ~ "Night",
+    TRUE ~ time)) %>%
+  mutate(age = case_when(
+    age %in% c("21", "26", "31", "36", "41", "46") ~ "21to50",
+    TRUE ~ age)) %>%
+  mutate(income = case_when(
+    income == "Less than $12500"  ~ 0,
+    income == "$12500 - $24999" ~ 1,
+    income == "$25000 - $37499" ~ 2,
+    income == "$37500 - $49999" ~ 3,
+    income == "$50000 - $62499" ~ 4, 
+    income == "$62500 - $74999" ~ 5,
+    income == "$75000 - $87499" ~ 6,
+    income == "$87500 - $99999" ~ 7,
+    income == "$100000 or More" ~ 8)) %>%
+  mutate(bar_gt1 = case_when(
+    bar_gt1 %in% c("never", "less1") ~ 0,
+    bar_gt1 %in% c("1~3", "4~8", "gt8") ~ 1)) %>% 
+  mutate(coffee_gt1 = case_when(
+    coffee_gt1 %in% c("never", "less1") ~ 0,
+    coffee_gt1 %in% c("1~3", "4~8", "gt8") ~ 1)) %>%
+  mutate(takeaway_gt1 = case_when(
+    takeaway_gt1 %in% c("never", "less1") ~ 0,
+    takeaway_gt1 %in% c("1~3", "4~8", "gt8") ~ 1)) %>%
+  mutate(restaurantless20_gt1 = case_when(
+    restaurantless20_gt1 %in% c("never", "less1") ~ 0,
+    restaurantless20_gt1 %in% c("1~3", "4~8", "gt8") ~ 1)) %>%
+  mutate(restaurant20plus_gt1 = case_when(
+    restaurant20plus_gt1 %in% c("never", "less1") ~ 0,
+    restaurant20plus_gt1 %in% c("1~3", "4~8", "gt8") ~ 1)) %>%
+  mutate_if(is.numeric, as.integer)
+```
+
+```{r}
+# Get the variable names (column names of coupon_df1)
+varnames <- colnames(coupon_df1)
+
+# Get the data types for each column
+data_types <- sapply(coupon_df1, class)
+
+# Create a vector for the outcomes
+outcomes <- c("No Urgent Place, Home, Work", 
+              "Alone, Friend(s), Kid(s), Partner", 
+              "Sunny, Rainy, Snowy", 
+              "30, 55, 80", 
+              "Morning, Noon, Afternoon, Evening, Night", 
+              "Bar, Coffee House, Take away, Restaurant(<$20), Restaurant($20-$50)", 
+              "1d, 2h", 
+              "Female, Male",
+              "Below 21, 21 to 50, Above 50", 
+              "Unmarried partner, Single, Married partner, Divorced, Widowed", 
+              "No = 0, Yes = 1",
+              "Some High School, High School Graduate, Some college, Bachelors degree, Associates degree, Graduate degree (Msc or PHD)",
+              "List of 25 occupations (incl. Unemployed, Student, Retired, Legal, Healthcare support etc.)",
+              "Less than $12500 = 0, $12500 - $24999 = 1, $25000 - $37499 = 2, $37500 - $49999 = 3, $50000 - $62499 = 4, $62500 - $74999 = 5, $75000 - $87499 = 6, $87500 - $99999 = 7, $100000 or More = 8",
+              "Visits Bar more than once per month (No = 0, Yes = 1)",
+              "Visits Coffee House more than once per month (No = 0, Yes = 1)",
+              "Gets Take Away food more than once per month (No = 0, Yes = 1)",
+              "Visits Restaurant with avg expense <$20 more than once per month (No = 0, Yes = 1)",
+              "Visits Restaurant with avg expense $20-$50 more than once per month (No = 0, Yes = 1)",
+              "Driving distance to the restaurant/bar for using the coupon is 15< minutes (No = 0, Yes = 1)",
+              "Driving distance to the restaurant/bar for using the coupon is 25< minutes (No = 0, Yes = 1)",
+              "restaurant/bar same direction as destination (No = 0, Yes = 1)",
+              "No = 0, Yes = 1")
+
+# Combine everything into a new data frame
+table_df <- data.frame(Variable = varnames, Type = data_types, Outcome = outcomes, row.names = NULL)
+
+# Display the table
+knitr::kable(table_df)
+```
+
+```{r, warning=FALSE}
+# define function for cramers V
+cramersV <- function(x, y) {
+  tbl <- table(x, y)
+  chi2 <- chisq.test(tbl, correct = FALSE)$statistic
+  n <- sum(tbl)
+  phi2 <- chi2 / n
+  minDim <- min(nrow(tbl)-1, ncol(tbl)-1)
+  sqrt(phi2 / minDim)
+}
+
+# creating correlation matrix (using cramers V)
+cor_matrix <- matrix(nrow = ncol(coupon_df1), ncol = ncol(coupon_df1))
+for (i in 1:ncol(coupon_df1)) {
+  for (j in 1:ncol(coupon_df1)) {
+    cor_matrix[i, j] <- cramersV(coupon_df1[[i]], coupon_df1[[j]])
+  }
+}
+rownames(cor_matrix) <- colnames(coupon_df1)
+colnames(cor_matrix) <- colnames(coupon_df1)
+cor_melted <- melt(cor_matrix)
+
+# plotting correlation matrix
+ggplot(cor_melted, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0.5, limit = c(0,1), space = "Lab", 
+                       name="Cramer's V") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = '', y = '', title = 'Correlation Matrix for Categorical Data')
+```
+
+```{r}
+coupon_df1$accept_coupon <- as.factor(coupon_df1$accept_coupon)  # Convert the target variable to a factor if it's a classification problem
+
+# Splitting the data into training and test sets
+set.seed(2024)  # for reproducibility
+train_indices <- sample(1:nrow(coupon_df1), size = 0.8*nrow(coupon_df1))  # 80% for training
+train_data <- coupon_df1[train_indices, ]
+test_data <- coupon_df1[-train_indices, ]
+
+# Train the model
+rf_model <- randomForest(accept_coupon ~ ., data = train_data, ntree = 200, mtry = 4)
+
+# Predict on test data
+predictions <- predict(rf_model, test_data)
+
+# Evaluate the model
+confusionMatrix(predictions, test_data$accept_coupon)  # for classification
+```
+
+```{r}
+set.seed(2024)  # For reproducibility
+
+# setting tuning parameters
+ntree_values = seq(10, 300, by = 10)
+mtry_values = c(2, 3, 4, 5)
+results = data.frame(ntree = integer(), mtry = integer(), accuracy = numeric())
+
+# iterating over models with various tuning parameters and calculating accuracy
+for (m in mtry_values) {
+  for (n in ntree_values) {
+    model = randomForest(accept_coupon ~ ., data = train_data, ntree = n, mtry = m)
+    predictions = predict(model, test_data)
+    accuracy = sum(predictions == test_data$accept_coupon) / nrow(test_data)
+    results = rbind(results, data.frame(ntree = n, mtry = m, accuracy = accuracy))
+  }
+}
+
+# visualizing accuracy for various models
+ggplot(results, aes(x = ntree, y = accuracy, color = as.factor(mtry))) +
+  geom_line() +
+  labs(title = "Random Forest Performance vs Number of Trees",
+       x = "Number of Trees",
+       y = "Accuracy",
+       color = "Mtry Value") +
+  theme_minimal()
+```
+
+```{r}
+# Forward feature selection
+
+set.seed(2024)  # For reproducibility
+sample_size <- floor(0.01 * nrow(coupon_df1))
+data_subset <- coupon_df1[sample(1:nrow(coupon_df1), sample_size), ]
+
+# Define base, additional and target variables
+all_vars <- names(data_subset)[1:22]  # All predictor variables
+base_vars <- names(data_subset)[c(3, 6:8, 10, 12:22)]
+additional_vars <- names(data_subset)[c(1, 2, 4, 5, 9, 11)]
+target_var <- names(data_subset)[23]
+
+# Define a 10-fold cross-validation
+control <- trainControl(method="cv", number=10)
+tuneGrid <- expand.grid(.mtry = c(2, 3, 4, 5, 6, 7, 8))
+performances <- data.frame(variable=character(), accuracy=numeric(), kappa=numeric(), stringsAsFactors=FALSE)
+
+# Train base model with Random Forest
+base_formula <- as.formula(paste(target_var, "~", paste(base_vars, collapse="+")))
+base_model <- train(base_formula, data=data_subset, method="rf", trControl=control, tuneGrid=tuneGrid)
+base_acc <- max(base_model$results$Accuracy)
+base_kappa <- max(base_model$results$Kappa)
+performances <- rbind(performances, data.frame(model_name="base_model", accuracy=base_acc, kappa = base_kappa))
+
+# Train full model with Random Forest
+full_model <- train(as.formula(paste(target_var, "~ .")), data=data_subset, method="rf", trControl=control, tuneGrid=tuneGrid)
+full_acc <- max(full_model$results$Accuracy)
+full_kappa <- max(full_model$results$Kappa)
+performances <- rbind(performances, data.frame(model_name="full_model", accuracy=full_acc, kappa = full_kappa))
+
+# Incremental feature addition
+used_vars <- base_vars
+for (var in additional_vars) {
+  used_vars <- c(used_vars, var)  # Add variable to current set
+  updated_formula <- as.formula(paste(target_var, "~", paste(used_vars, collapse="+")))
+  model <- train(updated_formula, data=data_subset, method="rf", trControl=control, tuneGrid=tuneGrid)
+  
+  mean_accuracy <- mean(model$results$Accuracy)
+  mean_kappa <- mean(model$results$Kappa)
+  
+  removed_vars <- setdiff(all_vars, used_vars)
+  model_name <- ifelse(length(removed_vars) == 0, "full_model", paste(removed_vars, collapse="+"))
+  
+  performances <- rbind(performances, data.frame(model_name=model_name, accuracy=mean_accuracy, kappa = mean_kappa))
+}
+
+# display table
+print(performances)
+```
+
+```{r}
+set.seed(2024)  # for reproducibility
+
+# Final model
+final_model <- coupon_df1[,-c(9, 11)]
+
+final_model$accept_coupon <- as.factor(final_model$accept_coupon)  # Convert the target variable to a factor if it's a classification problem
+
+# Splitting the data into training and test sets
+train_indices <- sample(1:nrow(final_model), size = 0.8*nrow(final_model))  # 80% for training
+train_data <- final_model[train_indices, ]
+test_data <- final_model[-train_indices, ]
+
+# Train the model
+rf_model <- randomForest(accept_coupon ~ ., data = train_data, ntree = 200, mtry = 4)
+
+# Predict on test data
+predictions <- predict(rf_model, test_data)
+
+# Evaluate the model
+confusionMatrix(predictions, test_data$accept_coupon)  # for classification
+```
+
+
+
+
+
